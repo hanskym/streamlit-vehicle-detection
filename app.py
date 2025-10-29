@@ -119,19 +119,28 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+MODEL_PATH = "best_vehicle_detector.pt"
+
 @st.cache_resource
 def load_model():
+    if not os.path.exists(MODEL_PATH):
+        st.error(f"Model file not found: {MODEL_PATH}")
+        return None
     try:
-        model = YOLO('best_vehicle_detector.pt')
+        model = YOLO(MODEL_PATH)
         return model
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
+        st.error(f"Error loading model: {e}")
         return None
 
 def detect_vehicles(image, model, conf_threshold):
     if isinstance(image, Image.Image):
         image = np.array(image)
-    results = model.predict(source=image, conf=conf_threshold, verbose=False)
+    try:
+        results = model.predict(source=image, conf=conf_threshold, verbose=False)
+    except Exception as e:
+        raise RuntimeError(f"Model inference failed: {e}") from e
+
     vehicle_counts = {'bus': 0, 'car': 0, 'van': 0}
     for result in results:
         boxes = result.boxes
@@ -144,7 +153,26 @@ def detect_vehicles(image, model, conf_threshold):
     annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
     return vehicle_counts, annotated_image
 
+def bytes_from_pil(img: Image.Image, fmt="PNG"):
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+def pil_from_bytes(b: bytes):
+    return Image.open(io.BytesIO(b))
+
 def main():
+    if 'detection_ran' not in st.session_state:
+        st.session_state.detection_ran = False
+    if 'annotated_image_bytes' not in st.session_state:
+        st.session_state.annotated_image_bytes = None
+    if 'original_image_bytes' not in st.session_state:
+        st.session_state.original_image_bytes = None
+    if 'vehicle_counts' not in st.session_state:
+        st.session_state.vehicle_counts = None
+    if 'inference_error' not in st.session_state:
+        st.session_state.inference_error = None
+
     st.markdown("<h1 style='text-align: center; color: var(--accent);'>🚗 Vehicle Detection System</h1>", unsafe_allow_html=True)
     st.markdown("<p style='text-align: center; font-size: 1.1rem; color: var(--muted);'>Deteksi dan hitung kendaraan (Bus, Car, Van) dalam gambar menggunakan YOLOv8s</p>", unsafe_allow_html=True)
     st.markdown("---")
@@ -178,57 +206,86 @@ def main():
     st.markdown("### 📤 Upload Gambar")
     uploaded_file = st.file_uploader("Pilih gambar kendaraan...", type=['jpg', 'jpeg', 'png'], help="Upload gambar dalam format JPG, JPEG, atau PNG")
 
+    if uploaded_file is None and st.session_state.detection_ran:
+        st.session_state.detection_ran = False
+        st.session_state.annotated_image_bytes = None
+        st.session_state.original_image_bytes = None
+        st.session_state.vehicle_counts = None
+        st.session_state.inference_error = None
+        if 'uploaded_filename' in st.session_state:
+            st.session_state.pop('uploaded_filename', None)
+
     if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.markdown(f"""
-        <div class='result-box'>
-            <b>📊 Info Gambar:</b><br>
-            • Ukuran: {image.size[0]} x {image.size[1]} pixels<br>
-            • Format: {image.format}<br>
-            • Mode: {image.mode}
-        </div>
-        """, unsafe_allow_html=True)
+        try:
+            image = Image.open(uploaded_file).convert("RGB")
+            st.session_state.uploaded_filename = uploaded_file.name
+            st.markdown(f"""
+            <div class='result-box'>
+                <b>📊 Info Gambar:</b><br>
+                • Ukuran: {image.size[0]} x {image.size[1]} pixels<br>
+                • Format: {image.format}<br>
+                • Mode: {image.mode}
+            </div>
+            """, unsafe_allow_html=True)
+        except Exception:
+            st.error("Gagal membaca file gambar.")
+            return
 
     if uploaded_file is not None:
         if st.button("🚀 Mulai Deteksi", width='stretch'):
             with st.spinner("🔍 Mendeteksi kendaraan..."):
-                vehicle_counts, annotated_image = detect_vehicles(image, model, conf_threshold)
-                st.session_state.annotated_image = annotated_image
-                st.session_state.vehicle_counts = vehicle_counts
-                st.session_state.detection_ran = True
+                try:
+                    image = Image.open(uploaded_file).convert("RGB")
+                    vehicle_counts, annotated_image = detect_vehicles(image, model, conf_threshold)
 
-    if st.session_state.get('detection_ran', False):
+                    pil_annotated = Image.fromarray(annotated_image)
+                    st.session_state.annotated_image_bytes = bytes_from_pil(pil_annotated)
+                    st.session_state.original_image_bytes = bytes_from_pil(image)
+                    st.session_state.vehicle_counts = vehicle_counts
+                    st.session_state.detection_ran = True
+                    st.session_state.inference_error = None
+                except Exception as e:
+                    st.session_state.inference_error = str(e)
+                    st.error(f"Error saat inferensi: {e}")
+
+    if st.session_state.detection_ran and st.session_state.annotated_image_bytes and st.session_state.original_image_bytes:
         st.markdown("---")
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### 🖼️ Gambar Original")
-            st.image(image, width='stretch')
+            orig = pil_from_bytes(st.session_state.original_image_bytes)
+            st.image(orig, width='stretch')
         with col2:
             st.markdown("#### 🎯 Hasil Deteksi")
-            st.image(st.session_state.annotated_image, width='stretch')
-        vehicle_counts = st.session_state.vehicle_counts
+            ann = pil_from_bytes(st.session_state.annotated_image_bytes)
+            st.image(ann, width='stretch')
+
+        vehicle_counts = st.session_state.vehicle_counts or {'bus':0,'car':0,'van':0}
         total_vehicles = sum(vehicle_counts.values())
         st.markdown(f"""
         <div class='result-box'>
             <h3>📊 Hasil Perhitungan</h3>
             <b>Total Kendaraan: {total_vehicles}</b><br>
-            <span class='count-badge bus-badge'>🚌 Bus: {vehicle_counts['bus']}</span>
-            <span class='count-badge car-badge'>🚗 Car: {vehicle_counts['car']}</span>
-            <span class='count-badge van-badge'>🚐 Van: {vehicle_counts['van']}</span>
+            <span class='count-badge bus-badge'>🚌 Bus: {vehicle_counts.get('bus', 0)}</span>
+            <span class='count-badge car-badge'>🚗 Car: {vehicle_counts.get('car', 0)}</span>
+            <span class='count-badge van-badge'>🚐 Van: {vehicle_counts.get('van', 0)}</span>
         </div>
         """, unsafe_allow_html=True)
 
-        result_image = Image.fromarray(st.session_state.annotated_image)
-        buf = io.BytesIO()
-        result_image.save(buf, format='PNG')
-        byte_im = buf.getvalue()
         st.download_button(
             label="📥 Download Hasil Deteksi",
-            data=byte_im,
-            file_name=f"detected_{uploaded_file.name}",
+            data=st.session_state.annotated_image_bytes,
+            file_name=f"detected_{st.session_state.get('uploaded_filename','image.png')}",
             mime="image/png",
             width='stretch'
         )
+    else:
+        if st.session_state.inference_error:
+            st.warning(f"Inference error: {st.session_state.inference_error}")
+        if uploaded_file is None:
+            st.info("👆 Upload gambar terlebih dahulu untuk memulai deteksi.")
+        else:
+            st.info("👆 Tekan tombol '🚀 Mulai Deteksi' untuk memproses gambar.")
 
     st.markdown("---")
     st.markdown("### 🖼️ Contoh Penggunaan")
